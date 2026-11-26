@@ -71,6 +71,35 @@ npm run dev
 | 人工复核队列 | `match_review` | 复核记录 | 记录编号、匹配记录、复核结论 |
 | 采集量指标 | `collect_metrics` | 指标记录 | 统计时间、站点名称、抓取量 |
 
+## 采集量指标迁移：旧站点累计 → 可持久化时间窗口版
+
+站点 K 的旧累计 **37**（无时间细分，只进站点总量、不分配到任何真实小时）
+已由数据库接收；解析质量审计页提供同站点身份（`site_key=K`）的审计窗
+`2026-11-26 09:00–10:00` 与迟到补报 **+2**。
+
+- **审计页**（`/parse_audit`）：「发布补报」；可勾选“模拟写入与迁移确认冲突”，
+  首次提交被 fence 以 `409 migration_conflict` 拒绝且不落库，值班员点
+  「继续发布」用同一幂等键 + 新 fence 成功。
+- **采集量指标页**（`/collect_metrics`）：并排展示
+  - 旧累计读端 `legacy-v1`：站点累计 **39**（原 `GET /api/collect_metrics` 列表仍可查 K 行）；
+  - 新版时间窗口读端 `window-v2`：无时间基线 **37** + 小时窗 **+2** = **39**，
+    37 不出现在任何小时；
+  - 「确认切换」生成**切换对账单**（37 + 2 = 39，差异 0），可「按切换对账单复验」；
+  - 「模拟回滚」只改写入资格相位，不删单据/小时窗，新旧读端仍为 39；
+  - 单据表可查补报持久化于哪一版有写入资格的端（`legacy-cumulative-writer-v1` /
+    `windowed-metrics-writer-v2`）以及哪几版读端已收到（`legacy-v1`、`window-v2`）。
+- **幂等与持久化**：同一 `report_key` 重放、跨切换或重启都只统计一次
+  （receipt 主键 + 小时窗唯一约束）。状态落在 SQLite：默认
+  `backend/data/metrics.db`，可用环境变量 `METRICS_DB_PATH` 覆盖。
+- **HTTP 接口**：`/api/metrics-migration/{state,legacy,windows,receipts,reconciliation}`
+  与 `POST .../{backfill,backfill/conflict,switch/confirm,reconciliation/verify,rollback,reset}`；
+  同组接口也挂在 `/api/collect_metrics/migration/*`。标准动作路由同样支持
+  `POST /api/parse_audit/{id}/actions {"action":"发布补报"}` 与
+  `POST /api/collect_metrics/{id}/actions` 的 `确认切换 / 按切换对账单复验 / 模拟回滚`。
+- **构建/上线核验**：`make verify`（或
+  `backend/.venv/bin/python scripts/verify_migration.py`）在临时库复演全部不变量；
+  前端 `npm run build` 含 `vue-tsc` 类型检查。
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。

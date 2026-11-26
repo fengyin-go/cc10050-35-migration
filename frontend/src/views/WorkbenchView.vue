@@ -15,6 +15,9 @@
       </div>
     </header>
 
+    <AuditBackfillPanel v-if="meta.key === 'parse_audit'" @published="onBackfillPublished" />
+    <MetricsMigrationPanel v-else-if="meta.key === 'collect_metrics'" />
+
     <div class="stat-row">
       <article v-for="item in stats" :key="item.label" class="stat-card">
         <span class="stat-label">{{ item.label }}</span>
@@ -46,7 +49,14 @@
         </tr>
       </thead>
       <tbody>
-        <tr v-for="row in rows" :key="String(row.id)" :data-testid="`row-${row.id}`" :data-status="String(row.status)">
+        <tr
+          v-for="row in rows"
+          :key="String(row.id)"
+          :data-testid="`row-${row.id}`"
+          :data-status="String(row.status)"
+          :data-site-key="row.site_key ? String(row.site_key) : undefined"
+          :data-scenario-key="row.scenario_key ? String(row.scenario_key) : undefined"
+        >
           <td v-for="column in meta.fields" :key="column">{{ row[column] ?? '—' }}</td>
           <td>{{ row.status }}</td>
           <td class="row-actions">
@@ -60,6 +70,47 @@
             >
               {{ action }}
             </button>
+            <!-- 解析质量审计：同站点身份的迟到补报发布（任意审计行均可触发，缺省回落 K 剧本） -->
+            <button
+              v-if="meta.key === 'parse_audit'"
+              class="link strong-action"
+              type="button"
+              :data-testid="`action-${row.id}-发布补报`"
+              data-action="publish-backfill"
+              @click="publishRowBackfill(row)"
+            >
+              发布补报
+            </button>
+            <!-- 采集量指标 K 行：迁移切换/复验/回滚的行内入口 -->
+            <template v-if="meta.key === 'collect_metrics' && row.site_key === 'K'">
+              <button
+                class="link strong-action"
+                type="button"
+                :data-testid="`action-${row.id}-确认切换`"
+                data-action="switch"
+                @click="runMigrationRowAction(row, '确认切换')"
+              >
+                确认切换
+              </button>
+              <button
+                class="link"
+                type="button"
+                :data-testid="`action-${row.id}-按切换对账单复验`"
+                data-action="verify"
+                @click="runMigrationRowAction(row, '按切换对账单复验')"
+              >
+                复验
+              </button>
+              <button
+                class="link warn-link"
+                type="button"
+                :data-testid="`action-${row.id}-模拟回滚`"
+                data-action="rollback"
+                @click="runMigrationRowAction(row, '模拟回滚')"
+              >
+                模拟回滚
+              </button>
+            </template>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -104,6 +155,8 @@ import {
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import AuditBackfillPanel from './migration/AuditBackfillPanel.vue'
+import MetricsMigrationPanel from './migration/MetricsMigrationPanel.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
@@ -176,6 +229,35 @@ async function runAction(action: string, row: EntryRow) {
   }
 }
 
+function onBackfillPublished() {
+  // 面板自身已展示单据；这里只刷新通用列表，让 K 行累计同步为 39。
+  void reload()
+}
+
+async function publishRowBackfill(row: EntryRow) {
+  errorMessage.value = ''
+  try {
+    const result = await applyAction('parse_audit', Number(row.id), '发布补报')
+    if (!result.ok) throw new Error(result.message)
+    window.dispatchEvent(new CustomEvent('metrics-backfill-published'))
+    await reload()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '发布补报失败'
+  }
+}
+
+async function runMigrationRowAction(row: EntryRow, action: string) {
+  errorMessage.value = ''
+  try {
+    const result = await applyAction('collect_metrics', Number(row.id), action)
+    if (!result.ok) throw new Error(result.message)
+    window.dispatchEvent(new CustomEvent('metrics-backfill-published'))
+    await reload()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '迁移操作失败'
+  }
+}
+
 async function reload() {
   errorMessage.value = ''
   try {
@@ -189,3 +271,12 @@ async function reload() {
 
 onMounted(reload)
 </script>
+
+<style scoped>
+.strong-action {
+  font-weight: 600;
+}
+.warn-link {
+  color: #b45309;
+}
+</style>

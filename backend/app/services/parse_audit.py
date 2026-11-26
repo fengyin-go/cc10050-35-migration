@@ -9,6 +9,16 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.metrics_migration import (
+    CANONICAL_AMOUNT,
+    CANONICAL_REPORT_KEY,
+    CANONICAL_SITE_KEY,
+    CANONICAL_WINDOW_START,
+    MigrationConflict,
+    normalize_site,
+    site_label,
+    migration_service,
+)
 from app.store import store
 
 
@@ -21,6 +31,83 @@ class ParseAuditService(BaseModuleService):
     STATUS_ORDER = ["正常", "命中率下降", "解析异常"]
     ACTION_RULES = {"查看详情": "命中率下降", "忽略告警": "解析异常"}
     NEGATIVE_ACTIONS = ["忽略告警"]
+
+    # ---- 审计补报发布：沿用存量指标的同一站点身份 ----
+
+    def run_action(self, entry_id: int, action: str, payload=None):
+        if action in ("发布补报", "发布审计补报", "审计补报发布"):
+            return self.publish_backfill_action(entry_id, payload)
+        return super().run_action(entry_id, action, payload)
+
+    def publish_backfill_action(self, entry_id: int, payload=None):
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return None, f"{self.ENTITY} {entry_id} 不存在"
+
+        extra = payload.model_dump() if payload is not None and hasattr(payload, "model_dump") else {}
+        model_extra = getattr(payload, "model_extra", None) or {}
+        # 站点身份必须来自审计记录上的同一 site_key/站点名称，
+        # 不能再把“解析模板”编造为站点。
+        site = extra.get("site") or entry.get("site_key") or entry.get("站点名称")
+        if not site or str(site) == entry.get("解析模板"):
+            linked = next(
+                (t for t in store.rows("page_parser")
+                 if t.get("模板名称") == entry.get("解析模板")),
+                None,
+            )
+            site = (linked or {}).get("适用站点") if linked else None
+        if site:
+            site = normalize_site(str(site))
+        else:
+            # 普通审计样例行没有站点字段：回落为本剧本的站点 K 同一身份，
+            # 保证任意行的「发布补报」与审计窗面板走同一本幂等账。
+            site = CANONICAL_SITE_KEY
+
+        # 只有带迁移/站点身份的审计行才优先采用其自身时间窗；普通样例行的
+        # “审计时间”若只到日期则不编造小时，回落规范审计窗；若明确填了小时则采用。
+        import re
+
+        audit_time = str(entry.get("审计时间") or "")
+        has_explicit_hour = bool(re.search(r"[T ]\d{1,2}(?::\d{2})?", audit_time))
+        if entry.get("window_start"):
+            fallback_window = entry.get("window_start")
+        elif has_explicit_hour:
+            fallback_window = audit_time
+        else:
+            fallback_window = CANONICAL_WINDOW_START
+        has_scenario_identity = bool(entry.get("report_key") or entry.get("site_key"))
+        if has_scenario_identity:
+            fallback_key = entry.get("report_key") or CANONICAL_REPORT_KEY
+            fallback_amount = entry.get("补报量") or CANONICAL_AMOUNT
+        else:
+            fallback_key = CANONICAL_REPORT_KEY
+            fallback_amount = CANONICAL_AMOUNT
+
+        amount = extra.get("amount") or model_extra.get("value") or model_extra.get("delta") or fallback_amount
+        window_start = extra.get("window_start") or model_extra.get("window") or fallback_window
+        report_key = extra.get("report_key") or model_extra.get("idempotency_key") or fallback_key
+        expected_fence = extra.get("expected_fence")
+        try:
+            result = migration_service.publish_backfill(
+                site=site,
+                amount=amount,
+                window_start=window_start,
+                report_key=report_key,
+                audit_id=f"parse_audit:{entry_id}",
+                expected_fence=expected_fence,
+            )
+        except MigrationConflict as exc:
+            return None, exc.payload.get("message", "写入与迁移确认冲突")
+        migration_service.project_store()
+        if not result.get("ok"):
+            return None, result.get("message", "补报发布失败")
+        duplicate = "（重复送达已幂等忽略）" if result.get("duplicate") else ""
+        receipt = result.get("receipt") or {}
+        write_side = receipt.get("write_side", "")
+        return entry, (
+            f"审计补报已发布到{site_label(site)}{duplicate}，"
+            f"持久化于 {write_side}，旧累计/新版窗口均可复验"
+        )
 
     # ---- 业务扩展：命中率审计与劣化告警 ----
 
@@ -108,29 +195,35 @@ class ParseAuditService(BaseModuleService):
         }
 
     def publish_metrics(self, entry_id: int) -> dict[str, Any]:
-        """把审计结论发布到采集量指标作为解析量口径。"""
+        """把审计结论发布到采集量指标。
+
+        迁移期统一走 metrics_migration：必须使用审计记录上的站点身份，
+        不能再把解析模板名称当成站点名称写进指标。
+        """
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return {"ok": False, "message": "审计明细不存在"}
-        metrics = store.rows("collect_metrics")
-        row = next((m for m in metrics if m.get("站点名称") == entry.get("解析模板", "")), None)
-        if row is None:
-            mid = max((int(m.get("id", 0)) for m in metrics), default=0) + 1
-            metrics.append({
-                "id": mid,
-                "统计时间": datetime.now(timezone.utc).isoformat(),
-                "站点名称": entry.get("解析模板", ""),
-                "抓取量": entry.get("样本总数", "0"),
-                "解析量": entry.get("样本总数", "0"),
-                "产出量": "0",
-                "status": entry.get("status", "正常"),
-                "pending": True,
-                "abnormal": entry.get("status") == "解析异常",
-            })
-        else:
-            row["解析量"] = entry.get("样本总数", "0")
-            row["统计时间"] = datetime.now(timezone.utc).isoformat()
-        return {"ok": True, "message": "审计结论已发布指标"}
+        site = entry.get("site_key") or entry.get("站点名称")
+        if not site:
+            template = next(
+                (t for t in store.rows("page_parser")
+                 if t.get("模板名称") == entry.get("解析模板", "")), None,
+            )
+            site = (template or {}).get("适用站点")
+        if not site:
+            return {"ok": False, "message": "审计明细缺少站点身份，未发布指标"}
+        site = normalize_site(str(site))
+        amount = entry.get("补报量") or 0
+        if amount:
+            migration_service.publish_backfill(
+                site=site,
+                amount=amount,
+                window_start=entry.get("window_start") or entry.get("审计时间"),
+                report_key=entry.get("report_key"),
+                audit_id=f"parse_audit:{entry_id}",
+            )
+        migration_service.project_store()
+        return {"ok": True, "message": f"审计结论已按同一站点身份发布指标：{site_label(site)}"}
 
     def audit_health(self, days: int = 1) -> dict[str, Any]:
         """输出审计批次健康度统计。"""

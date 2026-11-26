@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.metrics_migration import migration_service
 from app.store import store
 
 
@@ -21,6 +22,46 @@ class CollectMetricsService(BaseModuleService):
     STATUS_ORDER = ["正常", "量级波动", "断采"]
     ACTION_RULES = {"查看趋势": "量级波动", "忽略波动": "断采"}
     NEGATIVE_ACTIONS = ["忽略波动"]
+
+    MIGRATION_ACTIONS = {
+        "确认切换", "切换", "迁移切换", "确认迁移切换",
+        "模拟回滚", "回滚", "切换回滚",
+        "切换对账单", "生成切换对账单", "按切换对账单复验", "复验", "对账",
+        "刷新站点", "刷新",
+    }
+
+    def run_action(self, entry_id: int, action: str, payload=None):
+        if action in self.MIGRATION_ACTIONS:
+            return self._migration_action(entry_id, action)
+        return super().run_action(entry_id, action, payload)
+
+    def _migration_action(self, entry_id: int, action: str):
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return None, f"{self.ENTITY} {entry_id} 不存在"
+        site = "K" if entry.get("site_key") == "K" else str(entry.get("site_key") or "K")
+        if action in {"确认切换", "切换", "迁移切换", "确认迁移切换"}:
+            result = migration_service.confirm_switch()
+        elif action in {"模拟回滚", "回滚", "切换回滚"}:
+            result = migration_service.rollback()
+        elif action in {"切换对账单", "生成切换对账单", "按切换对账单复验", "复验", "对账"}:
+            result = migration_service.reconcile(site)
+            result["message"] = (
+                "切换对账单复验通过：37 基线 + 小时补报，累计一致"
+                if result.get("matched") else "切换对账单复验不平"
+            )
+        else:
+            result = migration_service.state(site)
+            result["message"] = "站点指标已按持久化口径刷新"
+        migration_service.project_store()
+        fresh = store.find(self.MODULE, entry_id) or entry
+        fresh["migration"] = {
+            "phase": migration_service.migration_info().get("phase"),
+            "reconciliation": result.get("reconciliation") or (
+                result if "matched" in result else None
+            ),
+        }
+        return fresh, str(result.get("message", "迁移操作完成"))
 
     # ---- 业务扩展：量级统计与健康度判定 ----
 

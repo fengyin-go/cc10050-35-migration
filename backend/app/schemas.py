@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Generic, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 T = TypeVar("T")
 
@@ -27,5 +27,14 @@ class EntryPayload(BaseModel):
 
 
 class ActionPayload(BaseModel):
+    # 允许迁移/补报类动作携带 fence、幂等键、时间窗等额外参数。
+    model_config = ConfigDict(extra="allow")
+
     action: str
     remark: str | None = None
+    site: str | None = None
+    amount: int | str | None = None
+    window_start: str | None = None
+    report_key: str | None = None
+    expected_fence: int | None = None
+    conflict_drill: bool | None = None
